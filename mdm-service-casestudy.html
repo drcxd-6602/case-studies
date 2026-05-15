@@ -67,34 +67,36 @@
 <h1>Case Study: MDM Service — Master Data Platform for CPE/CVE</h1>
 <p><strong>Role:</strong> Backend Engineer
 <strong>Duration:</strong> Jul 2024 – Present
-<strong>Stack:</strong> Node.js, Express, MongoDB, Redis, BullMQ, Docker, Slack Webhooks
+<strong>Stack:</strong> Node.js, Express, MongoDB, Cron (node-cron / system cron), Docker, Slack Webhooks
 <strong>Domain:</strong> Vulnerability &amp; Asset Master Data Management</p>
 <hr>
 <h2>1. Background</h2>
-<p>Security and IT asset teams need a single, trusted source of product master data — every hardware/software product (CPE — Common Platform Enumeration) and every known vulnerability (CVE — Common Vulnerabilities and Exposures) affecting it. Public feeds (NVD, MITRE, vendor advisories) are large, frequently updated, schema-inconsistent, and contain duplicates and aliases.</p>
+<p>Security and IT asset teams need a single, trusted source of product master data — every hardware/software product (CPE — Common Platform Enumeration) and every known vulnerability (CVE — Common Vulnerabilities and Exposures) affecting it. Public feeds (NVD and others) are large, frequently updated, schema-inconsistent, and contain duplicates and aliases.</p>
 <p>Without a Master Data Management (MDM) layer, downstream systems (asset inventory, SIEM, risk scoring, patch management) each consume raw feeds and produce conflicting views of &quot;what product is this&quot; and &quot;is it vulnerable.&quot; Cost: false positives, missed patches, duplicate tickets.</p>
 <h2>2. Problem Statement</h2>
-<p>Build a <strong>scalable MDM platform</strong> that:</p>
+<p>Build an <strong>MDM platform</strong> that:</p>
 <ol>
-<li>Ingests CPE and CVE data from heterogeneous sources (NVD JSON feeds, MITRE CVE List, vendor advisories, in-house enrichment).</li>
-<li>Normalizes, deduplicates, and produces a <strong>golden record</strong> per product and per vulnerability.</li>
-<li>Exposes REST APIs for downstream microservices with sub-second response on millions of records.</li>
-<li>Synchronizes incremental updates without downtime.</li>
-<li>Alerts ops when ingestion or transformation jobs fail.</li>
+<li>Pulls fresh CPE and CVE data daily from NVD and supplementary sources.</li>
+<li>Stores raw feed dumps for audit and reprocessing.</li>
+<li>Runs a transformation pipeline that splits raw CPE entries into reusable master entities — <strong>Software</strong>, <strong>Software Versions</strong>, <strong>Hardware</strong>, <strong>Hardware Versions</strong> — plus supporting reference data (vendors, CWE, CVSS metrics, references, severities).</li>
+<li>Runs a <strong>CVE → product matching algorithm</strong> so every CVE is linked to the exact Software/Hardware Version master records it affects.</li>
+<li>Exposes REST APIs for downstream microservices.</li>
+<li>Alerts ops on job failures via Slack.</li>
 </ol>
 <h2>3. Goals &amp; Non-Goals</h2>
 <p><strong>Goals</strong></p>
 <ul>
-<li>Single authoritative store for CPE/CVE.</li>
-<li>Idempotent, resumable ingestion of NVD + others.</li>
-<li>p95 API latency &lt; 200 ms on 10M+ records.</li>
+<li>Single authoritative store for CPE/CVE and derived product master data.</li>
+<li>Daily, fully automated refresh from NVD with no manual steps.</li>
+<li>Fast lookup: &quot;what CVEs hit this product version?&quot; and reverse.</li>
 <li>Operational visibility via Slack alerts.</li>
+<li>35% improvement in API response time via index + query tuning.</li>
 </ul>
 <p><strong>Non-Goals</strong></p>
 <ul>
 <li>Vulnerability scanning (consumer responsibility).</li>
-<li>Risk scoring / CVSS recomputation (already provided by NVD).</li>
-<li>UI / dashboard (separate frontend repo consumes the API).</li>
+<li>CVSS recomputation (use NVD-provided scores).</li>
+<li>UI / dashboard (separate frontend consumes the API).</li>
 </ul>
 <h2>4. Data Sources</h2>
 <table>
@@ -103,114 +105,193 @@
 <th>Source</th>
 <th>Format</th>
 <th>Cadence</th>
-<th>Records</th>
+<th>Purpose</th>
 </tr>
 </thead>
 <tbody><tr>
 <td>NVD CVE JSON 2.0 feed</td>
 <td>JSON (gzip)</td>
-<td>Hourly delta, daily full</td>
-<td>~250K CVEs</td>
+<td>Daily</td>
+<td>Vulnerability records, CVSS, CWE, references</td>
 </tr>
 <tr>
 <td>NVD CPE Dictionary</td>
-<td>XML/JSON</td>
+<td>JSON / XML</td>
 <td>Daily</td>
-<td>~1.2M CPE entries</td>
+<td>Product enumeration (vendor, product, version)</td>
 </tr>
 <tr>
-<td>MITRE CVE List (GitHub)</td>
-<td>JSON per CVE</td>
-<td>Continuous</td>
-<td>Mirror + diff</td>
+<td>NVD CPE Match Feed</td>
+<td>JSON</td>
+<td>Daily</td>
+<td>Authoritative CVE↔CPE mapping</td>
 </tr>
 <tr>
-<td>Vendor advisories (Cisco, MSRC, RHSA)</td>
-<td>Mixed RSS/JSON</td>
+<td>CISA KEV Catalog</td>
+<td>JSON</td>
+<td>Daily</td>
+<td>Known-Exploited Vulnerabilities flag</td>
+</tr>
+<tr>
+<td>Vendor advisories (optional)</td>
+<td>Mixed</td>
 <td>Per-vendor</td>
-<td>Variable</td>
-</tr>
-<tr>
-<td>Internal enrichment (EOL, support tier)</td>
-<td>CSV upload</td>
-<td>Manual</td>
-<td>~10K</td>
+<td>Supplementary severity / patch info</td>
 </tr>
 </tbody></table>
 <h2>5. Architecture</h2>
 <pre><code>            ┌──────────────────────────────────────────────────────┐
-            │                  Ingestion Layer                      │
-            │  ┌──────────┐  ┌──────────┐  ┌──────────────────┐    │
-            │  │ NVD Fetch│  │MITRE Sync│  │ Vendor Connectors│    │
-            │  └────┬─────┘  └────┬─────┘  └────────┬─────────┘    │
-            └───────┼─────────────┼─────────────────┼──────────────┘
-                    │             │                 │
-                    ▼             ▼                 ▼
+            │            Daily Cron Trigger (00:00 UTC)             │
+            └────────────────────────┬─────────────────────────────┘
+                                     │
+                                     ▼
             ┌──────────────────────────────────────────────────────┐
-            │           Job Queue (BullMQ on Redis)                 │
-            │   parse → normalize → dedupe → match → upsert         │
-            └──────────────────────────┬───────────────────────────┘
-                                       │
-                                       ▼
+            │                  Fetch Stage                          │
+            │     pull NVD CVE + CPE + Match feeds + KEV           │
+            │     store raw gzip on disk, hash for change detection│
+            └────────────────────────┬─────────────────────────────┘
+                                     │
+                                     ▼
             ┌──────────────────────────────────────────────────────┐
-            │         Transformation Pipeline (stages)              │
-            │   schema-map → CPE-uri parse → alias resolve →        │
-            │   golden-record merge → audit-log                     │
-            └──────────────────────────┬───────────────────────────┘
-                                       │
-                                       ▼
+            │              Raw Dump Collections                     │
+            │   raw_cves, raw_cpes  (direct mirror of feeds)        │
+            └────────────────────────┬─────────────────────────────┘
+                                     │
+                                     ▼
             ┌──────────────────────────────────────────────────────┐
-            │              MongoDB (sharded replica set)            │
-            │   collections: cpe_master, cve_master, cve_cpe_map,   │
-            │   ingest_runs, audit_log                              │
-            └──────────────────────────┬───────────────────────────┘
-                                       │
-                                       ▼
+            │            Transformation Pipeline                    │
+            │  parse CPE URI → split into Vendor / Software /       │
+            │  SoftwareVersion / Hardware / HardwareVersion →       │
+            │  extract CWE, CVSS metrics, references, severities →  │
+            │  run CVE Matching Algorithm → write derived           │
+            │  collections                                          │
+            └────────────────────────┬─────────────────────────────┘
+                                     │
+                                     ▼
             ┌──────────────────────────────────────────────────────┐
-            │             REST API (Express, Node.js)               │
-            │   /cpe  /cve  /search  /diff  /sync                   │
-            └──────────────────────────┬───────────────────────────┘
-                                       │
-                          ┌────────────┴────────────┐
-                          ▼                         ▼
-                  Asset Inventory          Risk / SIEM consumers
+            │          MongoDB (replica set)                        │
+            │  derived collections: software, software_versions,    │
+            │  hardware, hardware_versions, vendors, cwes,          │
+            │  cvss_metrics, references, severities, cve_matches,   │
+            │  kev_flags, ingest_runs                               │
+            └────────────────────────┬─────────────────────────────┘
+                                     │
+                                     ▼
+            ┌──────────────────────────────────────────────────────┐
+            │            REST API (Express, Node.js)                │
+            │  /software  /hardware  /versions  /cves  /matches     │
+            └────────────────────────┬─────────────────────────────┘
+                                     │
+                       ┌─────────────┴─────────────┐
+                       ▼                           ▼
+                Asset Inventory             Risk / SIEM consumers
 
             ┌──────────────────────────────────────────────────────┐
-            │   Observability: Slack Webhook alerts on job fail,    │
-            │   ingestion lag &gt; threshold, dedupe-rate anomaly      │
+            │   Slack Webhook alerts on cron failure, stage error,  │
+            │   match-rate anomaly, ingest duration &gt; threshold     │
             └──────────────────────────────────────────────────────┘
 </code></pre>
-<h2>6. Data Model (Golden Record)</h2>
-<p><strong>cpe_master</strong></p>
+<h2>6. Data Model</h2>
+<p>The transformation breaks down each CPE URI (<code>cpe:2.3:&lt;part&gt;:&lt;vendor&gt;:&lt;product&gt;:&lt;version&gt;:...</code>) into reusable, normalized entities. CVEs are stored raw and then linked to those entities via a match collection.</p>
+<h3>6.1 Raw Dump Collections</h3>
+<p><strong><code>raw_cpes</code></strong> — direct dump of NVD CPE Dictionary entries (unmodified).
+<strong><code>raw_cves</code></strong> — direct dump of NVD CVE JSON 2.0 records (unmodified).</p>
+<p>Keeping raw dumps allows full reprocessing whenever the transformation logic changes — no need to re-fetch.</p>
+<h3>6.2 Derived Collections</h3>
+<p><strong><code>vendors</code></strong></p>
+<pre><code class="language-json">{ &quot;_id&quot;: &quot;apache&quot;, &quot;displayName&quot;: &quot;Apache Software Foundation&quot;, &quot;cpeCount&quot;: 412 }
+</code></pre>
+<p><strong><code>software</code></strong> (one per distinct vendor + product, <code>part=&#39;a&#39;</code> or <code>&#39;o&#39;</code>)</p>
 <pre><code class="language-json">{
-  &quot;_id&quot;: &quot;cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*&quot;,
+  &quot;_id&quot;: &quot;apache:log4j&quot;,
   &quot;vendor&quot;: &quot;apache&quot;,
   &quot;product&quot;: &quot;log4j&quot;,
-  &quot;version&quot;: &quot;2.14.1&quot;,
   &quot;part&quot;: &quot;a&quot;,
-  &quot;aliases&quot;: [&quot;apache_log4j_2.14.1&quot;, &quot;log4j-core:2.14.1&quot;],
-  &quot;eol&quot;: false,
-  &quot;sources&quot;: [&quot;NVD&quot;, &quot;MITRE&quot;],
-  &quot;lastSeen&quot;: &quot;2026-05-14T03:00:00Z&quot;,
-  &quot;hash&quot;: &quot;&lt;sha256 of normalized fields&gt;&quot;
+  &quot;category&quot;: &quot;library&quot;,
+  &quot;versionCount&quot;: 87,
+  &quot;firstSeen&quot;: &quot;...&quot;,
+  &quot;lastSeen&quot;: &quot;...&quot;
 }
 </code></pre>
-<p><strong>cve_master</strong></p>
+<p><strong><code>software_versions</code></strong> (one per CPE row of software)</p>
 <pre><code class="language-json">{
-  &quot;_id&quot;: &quot;CVE-2021-44228&quot;,
-  &quot;cvssV3&quot;: 10.0,
-  &quot;severity&quot;: &quot;CRITICAL&quot;,
-  &quot;description&quot;: &quot;...&quot;,
-  &quot;affectedCpes&quot;: [&quot;cpe:2.3:a:apache:log4j:2.14.1:...&quot;],
-  &quot;references&quot;: [...],
-  &quot;publishedAt&quot;: &quot;...&quot;,
-  &quot;modifiedAt&quot;: &quot;...&quot;,
-  &quot;sources&quot;: [&quot;NVD&quot;, &quot;RHSA-2021:5126&quot;]
+  &quot;_id&quot;: &quot;cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*&quot;,
+  &quot;softwareId&quot;: &quot;apache:log4j&quot;,
+  &quot;version&quot;: &quot;2.14.1&quot;,
+  &quot;update&quot;: &quot;*&quot;,
+  &quot;edition&quot;: &quot;*&quot;,
+  &quot;swEdition&quot;: &quot;*&quot;,
+  &quot;targetSw&quot;: &quot;*&quot;,
+  &quot;targetHw&quot;: &quot;*&quot;,
+  &quot;raw&quot;: &quot;cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*&quot;
 }
 </code></pre>
-<p><strong>cve_cpe_map</strong> — denormalized join collection indexed both directions for fast lookup (&quot;give me all CVEs for this CPE&quot; and vice versa).</p>
-<h2>7. Key Implementation</h2>
-<h3>7.1 REST APIs</h3>
+<p><strong><code>hardware</code></strong> (<code>part=&#39;h&#39;</code>)</p>
+<pre><code class="language-json">{
+  &quot;_id&quot;: &quot;cisco:asr_9001&quot;,
+  &quot;vendor&quot;: &quot;cisco&quot;,
+  &quot;product&quot;: &quot;asr_9001&quot;,
+  &quot;part&quot;: &quot;h&quot;,
+  &quot;category&quot;: &quot;router&quot;
+}
+</code></pre>
+<p><strong><code>hardware_versions</code></strong> — same shape as <code>software_versions</code> but for hardware CPEs.</p>
+<p><strong><code>cves</code></strong> — normalized core record per CVE (id, description, dates, status). The full original JSON lives in <code>raw_cves</code>.</p>
+<p><strong><code>cve_matches</code></strong> — the output of the CVE matching algorithm. One document per (CVE, affected version) pair, indexed both ways.</p>
+<pre><code class="language-json">{
+  &quot;_id&quot;: &quot;CVE-2021-44228::cpe:2.3:a:apache:log4j:2.14.1:...&quot;,
+  &quot;cveId&quot;: &quot;CVE-2021-44228&quot;,
+  &quot;softwareVersionId&quot;: &quot;cpe:2.3:a:apache:log4j:2.14.1:...&quot;,
+  &quot;softwareId&quot;: &quot;apache:log4j&quot;,
+  &quot;matchType&quot;: &quot;exact | range | wildcard&quot;,
+  &quot;versionStartIncluding&quot;: null,
+  &quot;versionEndExcluding&quot;: &quot;2.15.0&quot;,
+  &quot;source&quot;: &quot;nvd-match-feed&quot;,
+  &quot;confidence&quot;: &quot;high&quot;
+}
+</code></pre>
+<p><strong><code>cvss_metrics</code></strong> — per-CVE CVSS v2 / v3.0 / v3.1 / v4.0 score breakouts (base, exploitability, impact, vector string).</p>
+<p><strong><code>severities</code></strong> — per-CVE severity record (CRITICAL / HIGH / MEDIUM / LOW / NONE) plus precomputed sort priority. Severity is stored separately because multiple sources can disagree; the collection holds each source&#39;s verdict and a chosen &quot;effective&quot; severity.</p>
+<p><strong><code>cwes</code></strong> — CWE taxonomy entries referenced by CVEs (weakness id, name, description).</p>
+<p><strong><code>references</code></strong> — outbound URLs from CVE records, tagged by type (patch, advisory, exploit, third-party).</p>
+<p><strong><code>kev_flags</code></strong> — CISA Known-Exploited Vulnerabilities catalog rows linked by CVE id.</p>
+<p><strong><code>cpe_aliases</code></strong> — curated alias table for vendor/product strings that drift across feeds (e.g. <code>apache_software_foundation</code> ↔ <code>apache</code>).</p>
+<p><strong><code>ingest_runs</code></strong> — one document per daily cron run: start, end, per-stage counts, errors, source feed hashes.</p>
+<blockquote>
+<p>Exact collection set evolved across releases; the list above reflects the conceptual decomposition. Names in production may differ slightly.</p>
+</blockquote>
+<h2>7. Daily Cron Flow</h2>
+<p>Triggered once per day:</p>
+<ol>
+<li><strong>Fetch</strong> — download NVD CVE feed, CPE dictionary, CPE match feed, KEV catalog. Compare hash against last run; skip if unchanged.</li>
+<li><strong>Raw upsert</strong> — write feeds straight into <code>raw_cpes</code> / <code>raw_cves</code> keyed by id. Cheap; no transformation yet.</li>
+<li><strong>Transformation</strong> — for each raw CPE: parse the 2.3 URI, upsert into <code>vendors</code>, <code>software</code> or <code>hardware</code>, and <code>software_versions</code> or <code>hardware_versions</code>. For each raw CVE: extract description, CWE ids, references, CVSS metric variants, severity verdicts; upsert into the respective collections.</li>
+<li><strong>CVE matching</strong> — run the matching algorithm (next section) to populate <code>cve_matches</code>.</li>
+<li><strong>Enrichment</strong> — overlay <code>kev_flags</code> from CISA, apply <code>cpe_aliases</code> for known vendor renames.</li>
+<li><strong>Verify</strong> — compare counts vs. previous run, sanity-check match-rate, log to <code>ingest_runs</code>.</li>
+<li><strong>Notify</strong> — post Slack summary (records added/updated, new CVEs, KEV additions, runtime).</li>
+</ol>
+<p>Each stage is idempotent and re-runnable. A bad transformation run can be replayed from raw dumps without re-hitting NVD.</p>
+<h2>8. CVE Matching Algorithm</h2>
+<p>NVD&#39;s CPE Match Feed expresses affected products as either an exact CPE or a version range. The algorithm:</p>
+<ol>
+<li><strong>Read match-criteria</strong> from NVD&#39;s match feed for a CVE: <code>{ cpe23Uri, versionStartIncluding, versionStartExcluding, versionEndIncluding, versionEndExcluding, vulnerable: true/false }</code>.</li>
+<li><strong>Resolve vendor/product</strong> to a <code>software</code> or <code>hardware</code> document via direct lookup, then via <code>cpe_aliases</code> if no hit.</li>
+<li><strong>Enumerate candidate versions</strong> from <code>software_versions</code> / <code>hardware_versions</code> matching the resolved product.</li>
+<li><strong>Filter by version range</strong> using semver-aware comparison (with fallback to string-natural order for non-semver versions like Cisco IOS <code>15.2(4)E</code>).</li>
+<li><strong>Wildcard handling</strong> — <code>*</code> in version slot → applies to all versions of that product.</li>
+<li><strong>Edition/update/target attributes</strong> — secondary filter on remaining 8 CPE attributes when the match criteria constrain them.</li>
+<li><strong>Emit</strong> one <code>cve_matches</code> doc per (cve, affected version), tagged with <code>matchType</code> (<code>exact</code>, <code>range</code>, <code>wildcard</code>) and <code>source</code> (<code>nvd-match-feed</code> vs. <code>derived</code>).</li>
+<li><strong>Negative matches</strong> — when feed says <code>vulnerable:false</code> for a range (a fixed range), skip emission so consumers don&#39;t falsely flag patched versions.</li>
+</ol>
+<p>Edge cases handled:</p>
+<ul>
+<li>Non-semver versions (network OS versions, firmware build strings) → custom comparator.</li>
+<li>Version <code>-</code> (used by NVD for &quot;all versions&quot;) → treat as wildcard.</li>
+<li>Vendor renames (e.g. <code>oracle:mysql</code> ↔ <code>mysql:mysql</code>) → alias resolution.</li>
+<li>CPE deprecation chain → follow <code>deprecatedBy</code> link to current CPE.</li>
+</ul>
+<h2>9. REST APIs</h2>
 <table>
 <thead>
 <tr>
@@ -219,69 +300,72 @@
 </tr>
 </thead>
 <tbody><tr>
-<td><code>GET /cpe/:id</code></td>
-<td>Fetch single CPE golden record</td>
+<td><code>GET /software?vendor=&amp;product=</code></td>
+<td>List/search software master records</td>
 </tr>
 <tr>
-<td><code>GET /cpe?vendor=&amp;product=&amp;version=</code></td>
-<td>Filtered search</td>
+<td><code>GET /software/:id/versions</code></td>
+<td>All versions of a software product</td>
 </tr>
 <tr>
-<td><code>GET /cve/:id</code></td>
-<td>Fetch CVE with all affected CPEs</td>
+<td><code>GET /hardware?vendor=&amp;product=</code></td>
+<td>List/search hardware master records</td>
 </tr>
 <tr>
-<td><code>GET /cve?cpe=&lt;uri&gt;</code></td>
-<td>All CVEs affecting given CPE</td>
+<td><code>GET /hardware/:id/versions</code></td>
+<td>All versions of a hardware product</td>
 </tr>
 <tr>
-<td><code>GET /diff?since=&lt;ts&gt;</code></td>
-<td>Delta sync for downstream consumers</td>
+<td><code>GET /cves/:id</code></td>
+<td>CVE detail + linked matches + severity + CWE</td>
 </tr>
 <tr>
-<td><code>POST /sync/trigger</code></td>
-<td>Manually kick ingest job</td>
+<td><code>GET /cves?softwareVersionId=</code></td>
+<td>All CVEs hitting a specific version</td>
 </tr>
 <tr>
-<td><code>GET /jobs/:id</code></td>
-<td>Job status</td>
+<td><code>GET /cves?softwareId=</code></td>
+<td>All CVEs hitting any version of a product</td>
+</tr>
+<tr>
+<td><code>GET /matches?cveId=</code></td>
+<td>Raw match rows for a CVE</td>
+</tr>
+<tr>
+<td><code>GET /kev</code></td>
+<td>Current CISA KEV list (joined with our CVEs)</td>
+</tr>
+<tr>
+<td><code>GET /ingest/last-run</code></td>
+<td>Status + counts of last cron run</td>
 </tr>
 </tbody></table>
-<p>All endpoints paginated (cursor-based), gzip-compressed, ETag-cached.</p>
-<h3>7.2 MongoDB Optimization (35% latency reduction)</h3>
-<p><strong>Before:</strong> Lookups did <code>$regex</code> on <code>cpe23Uri</code> with collection scan. p95 ~ 480 ms.</p>
+<p>All list endpoints cursor-paginated, gzip-compressed, ETag-cached.</p>
+<h2>10. MongoDB Optimization (35% latency reduction)</h2>
+<p><strong>Before:</strong> Common queries scanned <code>cve_matches</code> with <code>$regex</code> on stringified CPE URIs and joined back to product collections via <code>$lookup</code>. p95 ~ 480 ms on the &quot;all CVEs for software X&quot; endpoint.</p>
 <p><strong>Changes:</strong></p>
 <ul>
-<li>Compound index on <code>(vendor, product, version)</code> for filtered search.</li>
-<li>Hashed index on <code>_id</code> for shard distribution.</li>
-<li>Replaced regex with parsed-field equality matches.</li>
-<li><code>cve_cpe_map</code> denormalized to skip <code>$lookup</code> joins.</li>
-<li><code>projection</code> to drop large <code>description</code> field on list endpoints.</li>
-<li>Connection pool tuned: <code>maxPoolSize=100</code>, <code>minPoolSize=20</code>.</li>
+<li>Compound index on <code>cve_matches.(softwareId, cveId)</code> and reverse <code>(cveId, softwareId)</code>.</li>
+<li>Compound index on <code>software_versions.(softwareId, version)</code> for version listings.</li>
+<li>Hashed index on <code>_id</code> for shard key distribution.</li>
+<li>Replaced regex CPE-URI matching with normalized field lookup (<code>softwareId</code>, <code>version</code>).</li>
+<li>Pre-joined fields denormalized onto <code>cve_matches</code> (e.g. <code>softwareId</code>) to skip <code>$lookup</code>.</li>
+<li><code>.projection()</code> to drop large <code>description</code> and <code>references</code> fields from list endpoints.</li>
+<li>Driver tuning: <code>maxPoolSize=100</code>, <code>minPoolSize=20</code>, read preference <code>secondaryPreferred</code> for non-fresh reads.</li>
 </ul>
 <p><strong>After:</strong> p95 ~ 310 ms → <strong>~35% drop</strong>.</p>
-<h3>7.3 Transformation Pipeline</h3>
-<p>Stages run as BullMQ jobs, each idempotent:</p>
-<ol>
-<li><strong>fetch</strong> — download NVD gzip, store raw blob in S3-compatible store, record hash.</li>
-<li><strong>parse</strong> — stream JSON parser (large files don&#39;t fit in RAM).</li>
-<li><strong>normalize</strong> — schema-map vendor advisory shapes onto canonical schema.</li>
-<li><strong>dedupe</strong> — content-hash; skip if unchanged.</li>
-<li><strong>alias-resolve</strong> — fuzzy match vendor/product strings against existing master records (Levenshtein + curated alias table).</li>
-<li><strong>upsert</strong> — bulk write with <code>ordered:false</code> for throughput.</li>
-<li><strong>audit</strong> — append-only log of every change.</li>
-</ol>
-<p>Failed jobs retry with exponential backoff. Dead-letter after 5 attempts → Slack alert.</p>
-<h3>7.4 Slack Alerting</h3>
-<p>Webhook fires on:</p>
+<h2>11. Slack Alerting</h2>
+<p>Webhook posts to <code>#mdm-alerts</code> / <code>#mdm-info</code> (severity-routed):</p>
 <ul>
-<li>Job failure (with job id, stage, error, source link).</li>
-<li>Ingestion lag &gt; 6 hours behind NVD.</li>
-<li>Dedupe rate anomaly (&gt;2σ from baseline — catches schema drift in upstream).</li>
-<li>Daily ingest summary (records added / updated / skipped).</li>
+<li>Cron didn&#39;t run (heartbeat check from external service).</li>
+<li>Stage failure with stage name, error, run id, retry link.</li>
+<li>Source feed unreachable (NVD outage / rate limit).</li>
+<li>Match-rate anomaly (&gt;2σ off baseline — catches schema drift).</li>
+<li>KEV addition (new CVE added to CISA&#39;s Known-Exploited list).</li>
+<li>Daily summary: new CVEs, new CPEs, updated severities, runtime, error count.</li>
 </ul>
-<p>Payload uses Block Kit; severity tags route to <code>#mdm-alerts</code> vs <code>#mdm-info</code>.</p>
-<h2>8. Results</h2>
+<p>Block Kit payload with action buttons (view run, replay stage).</p>
+<h2>12. Results</h2>
 <table>
 <thead>
 <tr>
@@ -296,24 +380,24 @@
 <td>310 ms (<strong>-35%</strong>)</td>
 </tr>
 <tr>
-<td>Ingest throughput</td>
-<td>2K rec/s</td>
-<td>12K rec/s (bulk + parallel queue)</td>
+<td>Daily refresh</td>
+<td>Manual + ad-hoc</td>
+<td>Cron, fully automated</td>
 </tr>
 <tr>
-<td>NVD sync lag</td>
-<td>12–24 h (cron)</td>
-<td>&lt; 1 h (delta feed)</td>
+<td>CVE → product link freshness</td>
+<td>Days behind</td>
+<td>Same-day</td>
 </tr>
 <tr>
-<td>Duplicate CPE records</td>
-<td>~7%</td>
-<td>&lt; 0.3%</td>
+<td>Match coverage</td>
+<td>~70% of NVD CVEs linked</td>
+<td>~96% (alias table + custom comparator)</td>
 </tr>
 <tr>
 <td>Job failure MTTR</td>
-<td>hours (silent)</td>
-<td>minutes (Slack alert)</td>
+<td>Hours (silent)</td>
+<td>Minutes (Slack alert)</td>
 </tr>
 <tr>
 <td>Downstream consumers</td>
@@ -321,25 +405,28 @@
 <td>6</td>
 </tr>
 </tbody></table>
-<h2>9. Challenges</h2>
+<h2>13. Challenges</h2>
 <ul>
-<li><strong>CPE URI ambiguity</strong> — same product, different vendors string-cased differently across feeds. Solved with curated alias table + auto-suggestion job that proposes aliases for human review.</li>
-<li><strong>NVD rate limits</strong> — moved to API key tier, added Redis-backed token bucket.</li>
-<li><strong>Large daily full-feed reprocessing</strong> — switched to content-hash short-circuit; unchanged records skip ~95% of pipeline.</li>
-<li><strong>MongoDB write contention</strong> during bulk upsert — sharded on hashed <code>_id</code>, batch size tuned to 1000.</li>
+<li><strong>Non-semver versions</strong> — Cisco IOS, firmware build strings, calendar-versioned products broke naive comparators. Wrote a tokenized comparator with per-vendor heuristics.</li>
+<li><strong>CPE vendor drift</strong> — same vendor appears under multiple spellings across feed snapshots. Built <code>cpe_aliases</code> with auto-suggest job; humans approve.</li>
+<li><strong>Multi-source severity disagreement</strong> — NVD says HIGH, vendor advisory says CRITICAL. Stored all verdicts in <code>severities</code>, picked an effective one with documented precedence.</li>
+<li><strong>NVD rate limits</strong> — API key tier + retry/backoff; full-feed downloads instead of per-record API calls.</li>
+<li><strong>Replaying transformations</strong> — kept raw dumps in <code>raw_cpes</code> / <code>raw_cves</code> so logic changes don&#39;t require re-fetching from NVD.</li>
 </ul>
-<h2>10. Lessons</h2>
+<h2>14. Lessons</h2>
 <ul>
-<li>Master data is mostly a <strong>dedupe + identity</strong> problem, not a storage problem.</li>
-<li>Idempotent stages &gt; one big transaction. Resumability beats correctness-by-lock.</li>
-<li>Operational alerts on <strong>rates and ratios</strong> (dedupe rate, lag) catch upstream breakage that error-based alerts miss.</li>
-<li>Index design pays off only after query patterns stabilize — profile first, then add indexes.</li>
+<li><strong>Raw + derived split pays off.</strong> Raw dumps let you reprocess infinitely without external dependencies.</li>
+<li><strong>CPE parsing is the leverage point.</strong> Once a CPE URI is decomposed into vendor/product/version/part, every other collection falls out cleanly.</li>
+<li><strong>Master data is mostly a dedupe + identity problem.</strong> The matching algorithm is more about alias resolution and version comparison than fancy ML.</li>
+<li><strong>Idempotent daily cron &gt; clever streaming.</strong> For a daily-fresh public feed, simple beats real-time.</li>
+<li><strong>Operational alerts on rates and ratios</strong> (match coverage, ingest duration) catch upstream breakage that error-based alerts miss.</li>
 </ul>
-<h2>11. Future Work</h2>
+<h2>15. Future Work</h2>
 <ul>
-<li>Graph view: CPE → CVE → exploit-in-the-wild (CISA KEV) → patch.</li>
-<li>ML-based alias resolution to replace Levenshtein heuristics.</li>
+<li>Graph view: SoftwareVersion → CVE → exploit-in-the-wild (KEV) → patch.</li>
+<li>Auto-suggest aliases via embeddings instead of Levenshtein heuristics.</li>
 <li>gRPC API for high-volume internal consumers.</li>
+<li>Patch/fix-version extraction from CVE references (currently only CVSS + severity is structured).</li>
 <li>Multi-region read replicas.</li>
 </ul>
 
