@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>MDM Service Case Study</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    color: #1f2328;
+    line-height: 1.55;
+    font-size: 10.5pt;
+    max-width: 760px;
+    margin: 0 auto;
+  }
+  h1 { font-size: 22pt; border-bottom: 2px solid #d0d7de; padding-bottom: 6px; margin-top: 0; }
+  h2 { font-size: 14pt; border-bottom: 1px solid #d0d7de; padding-bottom: 4px; margin-top: 22px; page-break-after: avoid; }
+  h3 { font-size: 12pt; margin-top: 16px; page-break-after: avoid; }
+  h4 { font-size: 11pt; margin-top: 12px; }
+  p, li { font-size: 10.5pt; }
+  code {
+    font-family: "Consolas", "SF Mono", Menlo, Monaco, monospace;
+    background: #f6f8fa;
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 9.5pt;
+  }
+  pre {
+    background: #f6f8fa;
+    border: 1px solid #d0d7de;
+    border-radius: 6px;
+    padding: 10px 12px;
+    overflow-x: auto;
+    font-size: 9pt;
+    line-height: 1.4;
+    page-break-inside: avoid;
+  }
+  pre code { background: none; padding: 0; font-size: 9pt; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 10px 0;
+    font-size: 10pt;
+    page-break-inside: avoid;
+  }
+  th, td {
+    border: 1px solid #d0d7de;
+    padding: 6px 10px;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: #f6f8fa; font-weight: 600; }
+  hr { border: none; border-top: 1px solid #d0d7de; margin: 18px 0; }
+  blockquote {
+    border-left: 4px solid #d0d7de;
+    color: #57606a;
+    padding: 0 12px;
+    margin: 10px 0;
+  }
+  a { color: #0969da; text-decoration: none; }
+  ul, ol { padding-left: 22px; }
+  strong { font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>Case Study: MDM Service — Master Data Platform for CPE/CVE</h1>
+<p><strong>Role:</strong> Backend Engineer
+<strong>Duration:</strong> Jul 2024 – Present
+<strong>Stack:</strong> Node.js, Express, MongoDB, Redis, BullMQ, Docker, Slack Webhooks
+<strong>Domain:</strong> Vulnerability &amp; Asset Master Data Management</p>
+<hr>
+<h2>1. Background</h2>
+<p>Security and IT asset teams need a single, trusted source of product master data — every hardware/software product (CPE — Common Platform Enumeration) and every known vulnerability (CVE — Common Vulnerabilities and Exposures) affecting it. Public feeds (NVD, MITRE, vendor advisories) are large, frequently updated, schema-inconsistent, and contain duplicates and aliases.</p>
+<p>Without a Master Data Management (MDM) layer, downstream systems (asset inventory, SIEM, risk scoring, patch management) each consume raw feeds and produce conflicting views of &quot;what product is this&quot; and &quot;is it vulnerable.&quot; Cost: false positives, missed patches, duplicate tickets.</p>
+<h2>2. Problem Statement</h2>
+<p>Build a <strong>scalable MDM platform</strong> that:</p>
+<ol>
+<li>Ingests CPE and CVE data from heterogeneous sources (NVD JSON feeds, MITRE CVE List, vendor advisories, in-house enrichment).</li>
+<li>Normalizes, deduplicates, and produces a <strong>golden record</strong> per product and per vulnerability.</li>
+<li>Exposes REST APIs for downstream microservices with sub-second response on millions of records.</li>
+<li>Synchronizes incremental updates without downtime.</li>
+<li>Alerts ops when ingestion or transformation jobs fail.</li>
+</ol>
+<h2>3. Goals &amp; Non-Goals</h2>
+<p><strong>Goals</strong></p>
+<ul>
+<li>Single authoritative store for CPE/CVE.</li>
+<li>Idempotent, resumable ingestion of NVD + others.</li>
+<li>p95 API latency &lt; 200 ms on 10M+ records.</li>
+<li>Operational visibility via Slack alerts.</li>
+</ul>
+<p><strong>Non-Goals</strong></p>
+<ul>
+<li>Vulnerability scanning (consumer responsibility).</li>
+<li>Risk scoring / CVSS recomputation (already provided by NVD).</li>
+<li>UI / dashboard (separate frontend repo consumes the API).</li>
+</ul>
+<h2>4. Data Sources</h2>
+<table>
+<thead>
+<tr>
+<th>Source</th>
+<th>Format</th>
+<th>Cadence</th>
+<th>Records</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>NVD CVE JSON 2.0 feed</td>
+<td>JSON (gzip)</td>
+<td>Hourly delta, daily full</td>
+<td>~250K CVEs</td>
+</tr>
+<tr>
+<td>NVD CPE Dictionary</td>
+<td>XML/JSON</td>
+<td>Daily</td>
+<td>~1.2M CPE entries</td>
+</tr>
+<tr>
+<td>MITRE CVE List (GitHub)</td>
+<td>JSON per CVE</td>
+<td>Continuous</td>
+<td>Mirror + diff</td>
+</tr>
+<tr>
+<td>Vendor advisories (Cisco, MSRC, RHSA)</td>
+<td>Mixed RSS/JSON</td>
+<td>Per-vendor</td>
+<td>Variable</td>
+</tr>
+<tr>
+<td>Internal enrichment (EOL, support tier)</td>
+<td>CSV upload</td>
+<td>Manual</td>
+<td>~10K</td>
+</tr>
+</tbody></table>
+<h2>5. Architecture</h2>
+<pre><code>            ┌──────────────────────────────────────────────────────┐
+            │                  Ingestion Layer                      │
+            │  ┌──────────┐  ┌──────────┐  ┌──────────────────┐    │
+            │  │ NVD Fetch│  │MITRE Sync│  │ Vendor Connectors│    │
+            │  └────┬─────┘  └────┬─────┘  └────────┬─────────┘    │
+            └───────┼─────────────┼─────────────────┼──────────────┘
+                    │             │                 │
+                    ▼             ▼                 ▼
+            ┌──────────────────────────────────────────────────────┐
+            │           Job Queue (BullMQ on Redis)                 │
+            │   parse → normalize → dedupe → match → upsert         │
+            └──────────────────────────┬───────────────────────────┘
+                                       │
+                                       ▼
+            ┌──────────────────────────────────────────────────────┐
+            │         Transformation Pipeline (stages)              │
+            │   schema-map → CPE-uri parse → alias resolve →        │
+            │   golden-record merge → audit-log                     │
+            └──────────────────────────┬───────────────────────────┘
+                                       │
+                                       ▼
+            ┌──────────────────────────────────────────────────────┐
+            │              MongoDB (sharded replica set)            │
+            │   collections: cpe_master, cve_master, cve_cpe_map,   │
+            │   ingest_runs, audit_log                              │
+            └──────────────────────────┬───────────────────────────┘
+                                       │
+                                       ▼
+            ┌──────────────────────────────────────────────────────┐
+            │             REST API (Express, Node.js)               │
+            │   /cpe  /cve  /search  /diff  /sync                   │
+            └──────────────────────────┬───────────────────────────┘
+                                       │
+                          ┌────────────┴────────────┐
+                          ▼                         ▼
+                  Asset Inventory          Risk / SIEM consumers
+
+            ┌──────────────────────────────────────────────────────┐
+            │   Observability: Slack Webhook alerts on job fail,    │
+            │   ingestion lag &gt; threshold, dedupe-rate anomaly      │
+            └──────────────────────────────────────────────────────┘
+</code></pre>
+<h2>6. Data Model (Golden Record)</h2>
+<p><strong>cpe_master</strong></p>
+<pre><code class="language-json">{
+  &quot;_id&quot;: &quot;cpe:2.3:a:apache:log4j:2.14.1:*:*:*:*:*:*:*&quot;,
+  &quot;vendor&quot;: &quot;apache&quot;,
+  &quot;product&quot;: &quot;log4j&quot;,
+  &quot;version&quot;: &quot;2.14.1&quot;,
+  &quot;part&quot;: &quot;a&quot;,
+  &quot;aliases&quot;: [&quot;apache_log4j_2.14.1&quot;, &quot;log4j-core:2.14.1&quot;],
+  &quot;eol&quot;: false,
+  &quot;sources&quot;: [&quot;NVD&quot;, &quot;MITRE&quot;],
+  &quot;lastSeen&quot;: &quot;2026-05-14T03:00:00Z&quot;,
+  &quot;hash&quot;: &quot;&lt;sha256 of normalized fields&gt;&quot;
+}
+</code></pre>
+<p><strong>cve_master</strong></p>
+<pre><code class="language-json">{
+  &quot;_id&quot;: &quot;CVE-2021-44228&quot;,
+  &quot;cvssV3&quot;: 10.0,
+  &quot;severity&quot;: &quot;CRITICAL&quot;,
+  &quot;description&quot;: &quot;...&quot;,
+  &quot;affectedCpes&quot;: [&quot;cpe:2.3:a:apache:log4j:2.14.1:...&quot;],
+  &quot;references&quot;: [...],
+  &quot;publishedAt&quot;: &quot;...&quot;,
+  &quot;modifiedAt&quot;: &quot;...&quot;,
+  &quot;sources&quot;: [&quot;NVD&quot;, &quot;RHSA-2021:5126&quot;]
+}
+</code></pre>
+<p><strong>cve_cpe_map</strong> — denormalized join collection indexed both directions for fast lookup (&quot;give me all CVEs for this CPE&quot; and vice versa).</p>
+<h2>7. Key Implementation</h2>
+<h3>7.1 REST APIs</h3>
+<table>
+<thead>
+<tr>
+<th>Endpoint</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>GET /cpe/:id</code></td>
+<td>Fetch single CPE golden record</td>
+</tr>
+<tr>
+<td><code>GET /cpe?vendor=&amp;product=&amp;version=</code></td>
+<td>Filtered search</td>
+</tr>
+<tr>
+<td><code>GET /cve/:id</code></td>
+<td>Fetch CVE with all affected CPEs</td>
+</tr>
+<tr>
+<td><code>GET /cve?cpe=&lt;uri&gt;</code></td>
+<td>All CVEs affecting given CPE</td>
+</tr>
+<tr>
+<td><code>GET /diff?since=&lt;ts&gt;</code></td>
+<td>Delta sync for downstream consumers</td>
+</tr>
+<tr>
+<td><code>POST /sync/trigger</code></td>
+<td>Manually kick ingest job</td>
+</tr>
+<tr>
+<td><code>GET /jobs/:id</code></td>
+<td>Job status</td>
+</tr>
+</tbody></table>
+<p>All endpoints paginated (cursor-based), gzip-compressed, ETag-cached.</p>
+<h3>7.2 MongoDB Optimization (35% latency reduction)</h3>
+<p><strong>Before:</strong> Lookups did <code>$regex</code> on <code>cpe23Uri</code> with collection scan. p95 ~ 480 ms.</p>
+<p><strong>Changes:</strong></p>
+<ul>
+<li>Compound index on <code>(vendor, product, version)</code> for filtered search.</li>
+<li>Hashed index on <code>_id</code> for shard distribution.</li>
+<li>Replaced regex with parsed-field equality matches.</li>
+<li><code>cve_cpe_map</code> denormalized to skip <code>$lookup</code> joins.</li>
+<li><code>projection</code> to drop large <code>description</code> field on list endpoints.</li>
+<li>Connection pool tuned: <code>maxPoolSize=100</code>, <code>minPoolSize=20</code>.</li>
+</ul>
+<p><strong>After:</strong> p95 ~ 310 ms → <strong>~35% drop</strong>.</p>
+<h3>7.3 Transformation Pipeline</h3>
+<p>Stages run as BullMQ jobs, each idempotent:</p>
+<ol>
+<li><strong>fetch</strong> — download NVD gzip, store raw blob in S3-compatible store, record hash.</li>
+<li><strong>parse</strong> — stream JSON parser (large files don&#39;t fit in RAM).</li>
+<li><strong>normalize</strong> — schema-map vendor advisory shapes onto canonical schema.</li>
+<li><strong>dedupe</strong> — content-hash; skip if unchanged.</li>
+<li><strong>alias-resolve</strong> — fuzzy match vendor/product strings against existing master records (Levenshtein + curated alias table).</li>
+<li><strong>upsert</strong> — bulk write with <code>ordered:false</code> for throughput.</li>
+<li><strong>audit</strong> — append-only log of every change.</li>
+</ol>
+<p>Failed jobs retry with exponential backoff. Dead-letter after 5 attempts → Slack alert.</p>
+<h3>7.4 Slack Alerting</h3>
+<p>Webhook fires on:</p>
+<ul>
+<li>Job failure (with job id, stage, error, source link).</li>
+<li>Ingestion lag &gt; 6 hours behind NVD.</li>
+<li>Dedupe rate anomaly (&gt;2σ from baseline — catches schema drift in upstream).</li>
+<li>Daily ingest summary (records added / updated / skipped).</li>
+</ul>
+<p>Payload uses Block Kit; severity tags route to <code>#mdm-alerts</code> vs <code>#mdm-info</code>.</p>
+<h2>8. Results</h2>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Before</th>
+<th>After</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>p95 API latency</td>
+<td>480 ms</td>
+<td>310 ms (<strong>-35%</strong>)</td>
+</tr>
+<tr>
+<td>Ingest throughput</td>
+<td>2K rec/s</td>
+<td>12K rec/s (bulk + parallel queue)</td>
+</tr>
+<tr>
+<td>NVD sync lag</td>
+<td>12–24 h (cron)</td>
+<td>&lt; 1 h (delta feed)</td>
+</tr>
+<tr>
+<td>Duplicate CPE records</td>
+<td>~7%</td>
+<td>&lt; 0.3%</td>
+</tr>
+<tr>
+<td>Job failure MTTR</td>
+<td>hours (silent)</td>
+<td>minutes (Slack alert)</td>
+</tr>
+<tr>
+<td>Downstream consumers</td>
+<td>2</td>
+<td>6</td>
+</tr>
+</tbody></table>
+<h2>9. Challenges</h2>
+<ul>
+<li><strong>CPE URI ambiguity</strong> — same product, different vendors string-cased differently across feeds. Solved with curated alias table + auto-suggestion job that proposes aliases for human review.</li>
+<li><strong>NVD rate limits</strong> — moved to API key tier, added Redis-backed token bucket.</li>
+<li><strong>Large daily full-feed reprocessing</strong> — switched to content-hash short-circuit; unchanged records skip ~95% of pipeline.</li>
+<li><strong>MongoDB write contention</strong> during bulk upsert — sharded on hashed <code>_id</code>, batch size tuned to 1000.</li>
+</ul>
+<h2>10. Lessons</h2>
+<ul>
+<li>Master data is mostly a <strong>dedupe + identity</strong> problem, not a storage problem.</li>
+<li>Idempotent stages &gt; one big transaction. Resumability beats correctness-by-lock.</li>
+<li>Operational alerts on <strong>rates and ratios</strong> (dedupe rate, lag) catch upstream breakage that error-based alerts miss.</li>
+<li>Index design pays off only after query patterns stabilize — profile first, then add indexes.</li>
+</ul>
+<h2>11. Future Work</h2>
+<ul>
+<li>Graph view: CPE → CVE → exploit-in-the-wild (CISA KEV) → patch.</li>
+<li>ML-based alias resolution to replace Levenshtein heuristics.</li>
+<li>gRPC API for high-volume internal consumers.</li>
+<li>Multi-region read replicas.</li>
+</ul>
+
+</body>
+</html>
